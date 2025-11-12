@@ -2,33 +2,67 @@
   import { onMount } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
+
+  // 定义歌曲信息类型
+  interface SongInfo {
+    title: string;
+    artist: string;
+  }
 
   // 状态变量
   let audioContext: AudioContext | null = null;
   let analyser: AnalyserNode | null = null;
   let audioElement: HTMLAudioElement | null = null;
   let animationFrameId: number | null = null;
-  let bars: number[] = Array(64).fill(0);
+  let bars = $state(Array(64).fill(0));
   let currentSong = $state({ title: 'Loading...', artist: '' });
   let themeColor = $state('#3498db');
   let isPinned = $state(true);
   let isMousePassthrough = $state(false);
   let streamUrl = 'https://radio.startend.xyz/radio';
+  let isPlaying = $state(false);
   
   // 获取当前窗口实例
   const appWindow = getCurrentWindow();
   
   // 初始化音频上下文
-  function initAudio() {
+  async function initAudio() {
     try {
+      // 如果已有音频上下文，先清理
+      if (audioContext) {
+        await audioContext.close();
+      }
+      
       audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       analyser = audioContext.createAnalyser();
       analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.8;
       
       // 创建音频元素
+      if (audioElement) {
+        audioElement.pause();
+        audioElement = null;
+      }
+      
       audioElement = new Audio();
       audioElement.src = streamUrl;
       audioElement.crossOrigin = 'anonymous';
+      audioElement.volume = 0.8;
+      
+      // 添加事件监听器
+      audioElement.addEventListener('error', (e) => {
+        console.error('音频播放错误:', e);
+        isPlaying = false;
+      });
+      
+      audioElement.addEventListener('playing', () => {
+        isPlaying = true;
+      });
+      
+      audioElement.addEventListener('pause', () => {
+        isPlaying = false;
+      });
       
       // 连接音频节点
       const source = audioContext.createMediaElementSource(audioElement);
@@ -36,18 +70,31 @@
       analyser.connect(audioContext.destination);
       
       // 开始播放
-      audioElement.play().catch(e => console.error('播放失败:', e));
+      await audioContext.resume();
+      const playPromise = audioElement.play();
+      if (playPromise !== undefined) {
+        playPromise.catch(e => {
+          console.error('播放失败:', e);
+          isPlaying = false;
+        });
+      }
       
       // 开始可视化更新
       updateVisualization();
     } catch (error) {
       console.error('音频初始化失败:', error);
+      isPlaying = false;
     }
   }
   
   // 更新可视化
   function updateVisualization() {
-    if (!analyser) return;
+    if (!analyser || !audioContext) return;
+    
+    // 检查音频上下文状态
+    if (audioContext.state === 'suspended') {
+      audioContext.resume();
+    }
     
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(dataArray);
@@ -59,23 +106,17 @@
     animationFrameId = requestAnimationFrame(updateVisualization);
   }
   
-  // 获取当前播放歌曲信息
-  async function fetchCurrentSong() {
+  // 重新连接音频
+  async function reconnectAudio() {
     try {
-      // 这里使用轮询方式获取歌曲信息
-      // 您也可以根据需要改为 SSE 方式
-      const response = await fetch('https://radio.startend.xyz/status-json.xsl');
-      const data = await response.json();
-      
-      if (data.icestats && data.icestats.source && data.icestats.source.length > 0) {
-        const source = data.icestats.source[0];
-        currentSong = {
-          title: source.title || 'Unknown Title',
-          artist: source.artist || 'Unknown Artist'
-        };
+      if (audioElement) {
+        audioElement.pause();
       }
+      await initAudio();
     } catch (error) {
-      console.error('获取歌曲信息失败:', error);
+      console.error('重新连接音频失败:', error);
+      // 5秒后重试
+      setTimeout(reconnectAudio, 5000);
     }
   }
   
@@ -120,36 +161,59 @@
     // 设置窗口置顶
     setAlwaysOnTop(true);
     
-    // 定期获取歌曲信息
-    fetchCurrentSong();
-    const songInterval = setInterval(fetchCurrentSong, 10000); // 每10秒获取一次
+    // 监听Rust后端发送的歌曲信息更新事件
+    const unlisten = listen<SongInfo>('song-info-update', (event) => {
+      currentSong = {
+        title: event.payload.title || 'Unknown Title',
+        artist: event.payload.artist || 'Unknown Artist'
+      };
+    });
+    
+    // 定期检查音频状态
+    const audioCheckInterval = setInterval(() => {
+      if (audioContext && audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+      
+      // 如果音频停止播放，尝试重新连接
+      if (audioElement && audioElement.readyState === 0 && isPlaying) {
+        console.log('检测到音频连接断开，尝试重新连接...');
+        reconnectAudio();
+      }
+    }, 10000); // 每10秒检查一次
     
     // 返回清理函数
     return () => {
-      clearInterval(songInterval);
+      unlisten.then(f => f()); // 清理事件监听器
+      clearInterval(audioCheckInterval);
+      
       if (animationFrameId) {
         cancelAnimationFrame(animationFrameId);
       }
+      
       if (audioElement) {
         audioElement.pause();
+        audioElement = null;
       }
+      
       if (audioContext) {
         audioContext.close();
+        audioContext = null;
       }
     };
   });
 </script>
 
-<main class="container" on:mousedown={startDrag}>
+<div class="container" onmousedown={startDrag} role="button" tabindex="0">
   <div class="header">
     <div class="controls">
-      <button class="control-btn" on:click={() => setAlwaysOnTop(!isPinned)}>
+      <button class="control-btn" onclick={() => setAlwaysOnTop(!isPinned)}>
         {isPinned ? '🔓' : '🔒'}
       </button>
-      <button class="control-btn" on:click={() => setMousePassthrough(!isMousePassthrough)}>
+      <button class="control-btn" onclick={() => setMousePassthrough(!isMousePassthrough)}>
         {isMousePassthrough ? '🖱️' : '✋'}
       </button>
-      <button class="control-btn" on:click={minimizeWindow}>−</button>
+      <button class="control-btn" onclick={minimizeWindow}>−</button>
     </div>
   </div>
   
@@ -166,7 +230,7 @@
     <h2>{currentSong.title}</h2>
     <p>{currentSong.artist}</p>
   </div>
-</main>
+</div>
 
 <style>
   :global(body) {

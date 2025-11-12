@@ -3,6 +3,8 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
+  import { AudioAnalysis } from '$lib/visualizations/wavtools';
+  import BarVisualizer from '$lib/visualizations/core/BarVisualizer.svelte';
 
   // 定义歌曲信息类型
   interface SongInfo {
@@ -11,11 +13,10 @@
   }
 
   // 状态变量
-  let audioContext: AudioContext | null = null;
-  let analyser: AnalyserNode | null = null;
   let audioElement: HTMLAudioElement | null = null;
+  let audioAnalysis: AudioAnalysis | null = null;
   let animationFrameId: number | null = null;
-  let bars = $state(Array(64).fill(0));
+  let frequencyValues = $state(new Float32Array(64));
   let currentSong = $state({ title: 'Loading...', artist: '' });
   let themeColor = $state('#3498db');
   let isPinned = $state(true);
@@ -26,25 +27,20 @@
   // 获取当前窗口实例
   const appWindow = getCurrentWindow();
   
-  // 初始化音频上下文
+  // 初始化音频播放器
   async function initAudio() {
     try {
-      // 如果已有音频上下文，先清理
-      if (audioContext) {
-        await audioContext.close();
+      // 清理现有资源
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
       }
       
-      audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      analyser = audioContext.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.8;
-      
-      // 创建音频元素
       if (audioElement) {
         audioElement.pause();
         audioElement = null;
       }
       
+      // 创建新的音频元素
       audioElement = new Audio();
       audioElement.src = streamUrl;
       audioElement.crossOrigin = 'anonymous';
@@ -64,13 +60,13 @@
         isPlaying = false;
       });
       
-      // 连接音频节点
-      const source = audioContext.createMediaElementSource(audioElement);
-      source.connect(analyser);
-      analyser.connect(audioContext.destination);
+      // 创建音频分析器
+      audioAnalysis = new AudioAnalysis(audioElement);
+      
+      // 尝试恢复音频上下文
+      await audioAnalysis.resumeIfSuspended();
       
       // 开始播放
-      await audioContext.resume();
       const playPromise = audioElement.play();
       if (playPromise !== undefined) {
         playPromise.catch(e => {
@@ -89,21 +85,34 @@
   
   // 更新可视化
   function updateVisualization() {
-    if (!analyser || !audioContext) return;
+    if (!audioAnalysis) return;
     
-    // 检查音频上下文状态
-    if (audioContext.state === 'suspended') {
-      audioContext.resume();
+    try {
+      // 恢复音频上下文（如果被挂起）
+      audioAnalysis.resumeIfSuspended();
+      
+      // 获取频率数据
+      const frequencyData = audioAnalysis.getFrequencies('frequency', -100, -30);
+      
+      // 更新条形图数据（取前64个频率桶）
+      const values = frequencyData.values;
+      // 确保我们有正确的长度
+      if (values.length >= 64) {
+        frequencyValues = values.slice(0, 64);
+      } else {
+        // 如果数据不足，用0填充
+        const paddedValues = new Float32Array(64);
+        paddedValues.set(values);
+        frequencyValues = paddedValues;
+      }
+      
+      // 继续下一帧
+      animationFrameId = requestAnimationFrame(updateVisualization);
+    } catch (error) {
+      console.error('可视化更新失败:', error);
+      // 即使出错也继续更新
+      animationFrameId = requestAnimationFrame(updateVisualization);
     }
-    
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
-    analyser.getByteFrequencyData(dataArray);
-    
-    // 更新条形图数据
-    bars = Array.from(dataArray).slice(0, 64);
-    
-    // 继续下一帧
-    animationFrameId = requestAnimationFrame(updateVisualization);
   }
   
   // 重新连接音频
@@ -171,10 +180,6 @@
     
     // 定期检查音频状态
     const audioCheckInterval = setInterval(() => {
-      if (audioContext && audioContext.state === 'suspended') {
-        audioContext.resume();
-      }
-      
       // 如果音频停止播放，尝试重新连接
       if (audioElement && audioElement.readyState === 0 && isPlaying) {
         console.log('检测到音频连接断开，尝试重新连接...');
@@ -196,9 +201,8 @@
         audioElement = null;
       }
       
-      if (audioContext) {
-        audioContext.close();
-        audioContext = null;
+      if (audioAnalysis) {
+        audioAnalysis = null;
       }
     };
   });
@@ -217,13 +221,9 @@
     </div>
   </div>
   
-  <div class="visualization">
-    {#each bars as bar, i}
-      <div 
-        class="bar" 
-        style="height: {Math.max(bar / 2, 2)}px; background-color: {themeColor};"
-      ></div>
-    {/each}
+  <!-- 使用核心音频可视化组件 -->
+  <div class="visualization-container">
+    <BarVisualizer values={frequencyValues} color={themeColor} />
   </div>
   
   <div class="song-info">
@@ -286,20 +286,10 @@
     background: rgba(255, 255, 255, 0.3);
   }
   
-  .visualization {
-    display: flex;
-    align-items: end;
-    justify-content: center;
-    gap: 2px;
+  .visualization-container {
     height: 60px;
     margin-bottom: 10px;
-  }
-  
-  .bar {
-    width: 4px;
-    border-radius: 2px 2px 0 0;
-    transition: height 0.1s ease;
-    -webkit-app-region: no-drag;
+    width: 100%;
   }
   
   .song-info {
